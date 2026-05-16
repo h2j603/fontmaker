@@ -27,6 +27,11 @@ declare module 'svg-pathdata' {
     sanitize(): SVGPathData;
     round(n?: number): SVGPathData;
     matrix(a: number, b: number, c: number, d: number, e: number, f: number): SVGPathData;
+    transform(fn: (c: SVGCommand) => SVGCommand | SVGCommand[]): SVGPathData;
     encode(): string;
   }
+  export const SVGPathDataTransformer: {
+    NORMALIZE_HVZ(normalizeZ?: boolean): (c: SVGCommand) => SVGCommand | SVGCommand[];
+    NORMALIZE_ST(): (c: SVGCommand) => SVGCommand | SVGCommand[];
+  };
 }

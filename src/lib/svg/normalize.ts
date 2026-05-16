@@ -1,4 +1,4 @@
-import { SVGPathData } from 'svg-pathdata';
+import { SVGPathData, SVGPathDataTransformer } from 'svg-pathdata';
 import {
   IDENTITY,
   Matrix,
@@ -58,6 +58,93 @@ const DRAW_TAGS = new Set([
 
 type SubPath = { data: SVGPathData };
 
+/** Bake an SVG path `d` + element matrix into absolute cubic commands,
+ *  converting arcs/smooth/H/V while preserving CLOSE_PATH (Z). */
+export function bakePath(d: string, m: Matrix): SVGPathData {
+  return new SVGPathData(d)
+    .toAbs()
+    .aToC()
+    .normalizeST()
+    .transform(SVGPathDataTransformer.NORMALIZE_HVZ(false))
+    .matrix(...m);
+}
+
+/** Tight-ish bbox of a path `d` (uses on/off-curve points). */
+export function pathBBox(d: string): { x: number; y: number; w: number; h: number } {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  try {
+    for (const c of new SVGPathData(d).toAbs().commands) {
+      const cc = c as unknown as Record<string, number>;
+      for (const [px, py] of [
+        [cc.x, cc.y],
+        [cc.x1, cc.y1],
+        [cc.x2, cc.y2],
+      ] as const) {
+        if (px === undefined || py === undefined) continue;
+        minX = Math.min(minX, px);
+        minY = Math.min(minY, py);
+        maxX = Math.max(maxX, px);
+        maxY = Math.max(maxY, py);
+      }
+    }
+  } catch {
+    /* malformed */
+  }
+  if (!isFinite(minX)) return { x: 0, y: 0, w: 0, h: 0 };
+  return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
+export type ContourResult = { merged: string[]; openCount: number; maxGap: number };
+
+/** Split each subpath into contours, close every contour so it is fillable,
+ *  and report contours that were genuinely open (gap > threshold). */
+export function closeContours(subs: SubPath[], N: Matrix): ContourResult {
+  const merged: string[] = [];
+  let openCount = 0;
+  let maxGap = 0;
+  for (const sub of subs) {
+    const cmds = sub.data.matrix(...N).round(2).commands;
+    let i = 0;
+    while (i < cmds.length) {
+      if (cmds[i].type !== SVGPathData.MOVE_TO) {
+        i++;
+        continue;
+      }
+      const contour: typeof cmds = [];
+      const start = cmds[i] as unknown as Record<string, number>;
+      contour.push(cmds[i]);
+      i++;
+      let closed = false;
+      let lastPt = { x: start.x, y: start.y };
+      while (i < cmds.length && cmds[i].type !== SVGPathData.MOVE_TO) {
+        const c = cmds[i];
+        if (c.type === SVGPathData.CLOSE_PATH) {
+          closed = true;
+          i++;
+          break;
+        }
+        const cc = c as unknown as Record<string, number>;
+        if (cc.x !== undefined) lastPt = { x: cc.x, y: cc.y };
+        contour.push(c);
+        i++;
+      }
+      if (contour.length < 2) continue; // lone moveto — drop noise point
+      if (!closed) {
+        const gap = Math.hypot(lastPt.x - start.x, lastPt.y - start.y);
+        if (gap > NEAR_OPEN_THRESHOLD) {
+          openCount++;
+          maxGap = Math.max(maxGap, gap);
+        }
+      }
+      contour.push({ type: SVGPathData.CLOSE_PATH });
+      const cd = new SVGPathData('M0 0');
+      cd.commands = contour;
+      merged.push(cd.encode());
+    }
+  }
+  return { merged, openCount, maxGap };
+}
+
 function collect(el: Element, parentMatrix: Matrix, out: SubPath[]) {
   const tag = el.tagName.toLowerCase();
   if (tag === 'defs' || tag === 'clippath' || tag === 'mask' || tag === 'symbol')
@@ -67,8 +154,7 @@ function collect(el: Element, parentMatrix: Matrix, out: SubPath[]) {
     const d = shapeToPathD(el);
     if (d) {
       try {
-        const data = new SVGPathData(d).toAbs().aToC().normalizeHVZ().matrix(...m);
-        out.push({ data });
+        out.push({ data: bakePath(d, m) });
       } catch {
         /* skip malformed subpath */
       }
@@ -160,34 +246,14 @@ export function normalizeSvg(
   // Font-coordinate normalization matrix: flip Y, scale, move to origin.
   const N: Matrix = [s, 0, 0, -s, -bb.minX * s, bb.maxY * s];
 
-  const merged: string[] = [];
-  for (const sub of subs) {
-    const baked = sub.data
-      .matrix(...N)
-      .normalizeST()
-      .aToC();
-    const cmds = baked.commands;
-    if (cmds.length === 0) continue;
-
-    // Auto-fix: close near-open subpaths.
-    const first = cmds[0] as unknown as Record<string, number>;
-    const last = cmds[cmds.length - 1] as unknown as Record<string, number>;
-    const hasClose = cmds.some((c) => c.type === SVGPathData.CLOSE_PATH);
-    if (
-      !hasClose &&
-      first.x !== undefined &&
-      last.x !== undefined &&
-      Math.hypot(first.x - last.x, first.y - last.y) <= NEAR_OPEN_THRESHOLD
-    ) {
-      baked.commands.push({ type: SVGPathData.CLOSE_PATH });
-      warnings.push({
-        code: 'auto-close',
-        message: `열린 패스를 자동으로 연결했습니다 (간격 ${Math.round(
-          Math.hypot(first.x - last.x, first.y - last.y),
-        )} units).`,
-      });
-    }
-    merged.push(baked.round(2).encode());
+  const { merged, openCount, maxGap } = closeContours(subs, N);
+  if (openCount > 0) {
+    warnings.push({
+      code: 'auto-close',
+      message: `열린 윤곽선 ${openCount}개를 자동으로 닫았습니다 (최대 간격 ${Math.round(
+        maxGap,
+      )} units). 획(stroke) 기반 SVG라면 Illustrator에서 Outline Stroke 후 다시 내보내세요.`,
+    });
   }
 
   if (merged.length === 0) {
